@@ -8,6 +8,7 @@ on:
         description: "Comma-separated channel IDs"
         required: false
         default: ""
+
 jobs:
   scrape:
     runs-on: ubuntu-22.04
@@ -15,16 +16,27 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -r requirements.txt && playwright install chromium --with-deps
-      - run: python scraper.py
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt && playwright install chromium --with-deps
+
+      - name: Run scraper
+        run: python scraper_v4.py
         env:
           CHANNEL_IDS: ${{ github.event.inputs.channel_ids }}
-      - run: cat fetch.m3u
-      - run: |
+          BLAST_EMAIL: ${{ secrets.BLAST_EMAIL }}
+          BLAST_PASSWORD: ${{ secrets.BLAST_PASSWORD }}
+
+      - name: Show output
+        run: cat fetch.m3u
+
+      - name: Commit and push fetch.m3u
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add fetch.m3u
