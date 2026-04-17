@@ -1,10 +1,7 @@
 """
-BlastTV M3U Scraper — v4
-Adds automatic login before scraping channels.
-
-Fill in your credentials below, then run:
-    pip install playwright && python -m playwright install chromium
-    python scraper_v4.py
+BlastTV M3U Scraper — v5
+Credentials are read from environment variables only (never hardcoded).
+Set BLAST_EMAIL and BLAST_PASSWORD as GitHub Actions secrets.
 """
 
 import asyncio
@@ -15,17 +12,13 @@ import json
 import logging
 from pathlib import Path
 
-# ── ✏️  YOUR CREDENTIALS — fill these in ─────────────────────────────────────
-BLAST_EMAIL    = "captainmonk03@gmail.com"          # e.g. "you@example.com"
-BLAST_PASSWORD = "Secret03king05"          # e.g. "yourpassword"
-# ─────────────────────────────────────────────────────────────────────────────
-
 # ── Config ────────────────────────────────────────────────────────────────────
 LOGIN_URL      = "https://app.blasttv.ph/login"
 BASE_URL       = "https://app.blasttv.ph/live/"
 OUTPUT_FILE    = "fetch.m3u"
 TIMEOUT_MS     = 60_000
-PAGE_WAIT_MS   = 20_000
+PAGE_WAIT_MS   = 25_000   # bumped from 20s to 25s
+LOGIN_WAIT_MS  = 8_000    # bumped from 5s to 8s
 LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
 SCREENSHOT_DIR = Path("screenshots")
 NETLOG_FILE    = Path("network_log.json")
@@ -76,28 +69,31 @@ def search_json(obj, found: list, depth=0):
 # ── Login ─────────────────────────────────────────────────────────────────────
 async def do_login(context) -> bool:
     """Navigate to the login page and submit credentials. Returns True on success."""
-    email    = os.getenv("BLAST_EMAIL",    BLAST_EMAIL)
-    password = os.getenv("BLAST_PASSWORD", BLAST_PASSWORD)
+    email    = os.getenv("BLAST_EMAIL", "").strip()
+    password = os.getenv("BLAST_PASSWORD", "").strip()
 
     if not email or not password:
-        log.error("No credentials set. Edit BLAST_EMAIL / BLAST_PASSWORD in the script.")
+        log.error("No credentials set. Add BLAST_EMAIL / BLAST_PASSWORD as GitHub Actions secrets.")
         return False
 
     page = await context.new_page()
     try:
         log.info("Logging in as %s ...", email)
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-        await page.wait_for_timeout(3000)
+        await page.goto(LOGIN_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
+        await page.wait_for_timeout(5000)  # wait longer for JS to render
 
         SCREENSHOT_DIR.mkdir(exist_ok=True)
         await page.screenshot(path=str(SCREENSHOT_DIR / "login_A_before.png"))
 
-        # Try common email/password field selectors
+        page_text = await page.evaluate("() => document.body?.innerText?.slice(0,500) || ''")
+        log.info("  Login page text: %s", page_text[:300])
+
         email_selectors = [
             'input[type="email"]',
             'input[name="email"]',
             'input[placeholder*="email" i]',
             'input[id*="email" i]',
+            'input[autocomplete="email"]',
         ]
         pass_selectors = [
             'input[type="password"]',
@@ -111,12 +107,13 @@ async def do_login(context) -> bool:
             'button:has-text("Login")',
             'button:has-text("Sign in")',
             'button:has-text("Log in")',
+            'button:has-text("Continue")',
         ]
 
         email_field = None
         for sel in email_selectors:
             try:
-                await page.wait_for_selector(sel, timeout=3000)
+                await page.wait_for_selector(sel, timeout=5000)
                 email_field = sel
                 break
             except Exception:
@@ -125,19 +122,24 @@ async def do_login(context) -> bool:
         pass_field = None
         for sel in pass_selectors:
             try:
-                await page.wait_for_selector(sel, timeout=3000)
+                await page.wait_for_selector(sel, timeout=5000)
                 pass_field = sel
                 break
             except Exception:
                 continue
 
         if not email_field or not pass_field:
-            log.error("Could not find login form fields. Check screenshots/login_A_before.png")
+            log.error("Could not find login form fields.")
+            log.error("All inputs on page: %s", await page.evaluate(
+                "() => [...document.querySelectorAll('input')].map(i => i.outerHTML.slice(0,120))"
+            ))
             await page.screenshot(path=str(SCREENSHOT_DIR / "login_B_fields_not_found.png"))
             return False
 
         await page.fill(email_field, email)
+        await page.wait_for_timeout(500)
         await page.fill(pass_field, password)
+        await page.wait_for_timeout(500)
         await page.screenshot(path=str(SCREENSHOT_DIR / "login_B_filled.png"))
         log.info("  Filled credentials, submitting...")
 
@@ -155,18 +157,17 @@ async def do_login(context) -> bool:
         else:
             await page.keyboard.press("Enter")
 
-        # Wait for navigation after login
-        await page.wait_for_timeout(5000)
+        # Wait longer for post-login redirect
+        await page.wait_for_timeout(LOGIN_WAIT_MS)
         await page.screenshot(path=str(SCREENSHOT_DIR / "login_C_after.png"))
 
-        # Check if still on login page (= login failed)
         current_url = page.url
         page_text   = await page.evaluate("() => document.body?.innerText?.slice(0,500) || ''")
         log.info("  Post-login URL: %s", current_url)
+        log.info("  Post-login page text: %s", page_text[:300])
 
         if "login" in current_url.lower():
-            log.error("Still on login page — credentials may be wrong or CAPTCHA present.")
-            log.error("Page text: %s", page_text[:300])
+            log.error("Still on login page — credentials may be wrong, or CAPTCHA is blocking.")
             return False
 
         log.info("  ✅ Login successful!")
@@ -256,7 +257,6 @@ async def scrape_channel(page, channel_id: str, pass_num: int = 1):
         await page.screenshot(path=str(ss2))
         log.info("  📸 %s", ss2)
 
-        # Player / DOM / SSR blob extraction
         player_urls = await page.evaluate("""() => {
             const urls = [];
             for (const key of Object.keys(window)) {
@@ -346,12 +346,10 @@ async def build_m3u(channels: list) -> list:
             timezone_id="Asia/Manila",
         )
 
-        # ── Login first ───────────────────────────────────────────────────
         logged_in = await do_login(context)
         if not logged_in:
             log.warning("Proceeding without login — streams may not load.")
 
-        # ── Scrape each channel ───────────────────────────────────────────
         for channel_id in channels:
             page = await context.new_page()
             stream_url = await scrape_channel(page, channel_id, pass_num=1)
@@ -422,8 +420,8 @@ async def main():
         log.error(
             "\nNo streams found. Tips:\n"
             "  1. Check screenshots/ for login errors or CAPTCHA\n"
-            "  2. Verify BLAST_EMAIL / BLAST_PASSWORD in the script\n"
-            "  3. Run on a Philippine IP — the site blocks foreign IPs\n"
+            "  2. Verify BLAST_EMAIL / BLAST_PASSWORD are set in GitHub Secrets\n"
+            "  3. Run on a Philippine IP — the site may block foreign IPs\n"
             "  4. Check network_log.json for auth/token API clues"
         )
         sys.exit(1)
