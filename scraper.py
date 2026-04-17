@@ -1,13 +1,10 @@
 """
-BlastTV M3U Scraper — v2
-Intercepts HLS/M3U stream URLs from app.blasttv.ph/live/<id>
+BlastTV M3U Scraper — v4
+Adds automatic login before scraping channels.
 
-Strategy (in order):
-  1. Intercept all network REQUEST urls for m3u8/hls patterns
-  2. Intercept all network RESPONSE bodies for stream URLs
-  3. Sniff XHR/fetch JSON responses for embedded stream URLs
-  4. Search the page DOM for video src / source tags
-  5. Try direct API guesses based on channel ID
+Fill in your credentials below, then run:
+    pip install playwright && python -m playwright install chromium
+    python scraper_v4.py
 """
 
 import asyncio
@@ -18,29 +15,28 @@ import json
 import logging
 from pathlib import Path
 
+# ── ✏️  YOUR CREDENTIALS — fill these in ─────────────────────────────────────
+BLAST_EMAIL    = "captainmonk03@gmail.com"          # e.g. "you@example.com"
+BLAST_PASSWORD = "Secret03king05"          # e.g. "yourpassword"
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE_URL = "https://app.blasttv.ph/live/"
-OUTPUT_FILE = "fetch.m3u"
-TIMEOUT_MS = 45_000        # max wait per page (ms)
-PAGE_WAIT_MS = 15_000      # settle time — increased to 15s for slow JS players
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOGIN_URL      = "https://app.blasttv.ph/login"
+BASE_URL       = "https://app.blasttv.ph/live/"
+OUTPUT_FILE    = "fetch.m3u"
+TIMEOUT_MS     = 60_000
+PAGE_WAIT_MS   = 20_000
+LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
+SCREENSHOT_DIR = Path("screenshots")
+NETLOG_FILE    = Path("network_log.json")
 
-DEFAULT_CHANNELS = [
-    "300024",
-]
+DEFAULT_CHANNELS = ["300024"]
 
-# Patterns that indicate a stream URL
 HLS_PATTERNS = [
-    r"\.m3u8",
-    r"\.m3u",
-    r"/hls/",
-    r"/stream/",
-    r"/live/stream",
-    r"/playlist",
-    r"manifest",
-    r"/index\.m",
-    r"videoplayback",
-    r"chunklist",
+    r"\.m3u8", r"\.m3u", r"/hls/", r"/stream/",
+    r"/live/stream", r"/playlist", r"manifest",
+    r"/index\.m", r"videoplayback", r"chunklist",
+    r"token=", r"sig=",
 ]
 HLS_REGEX = re.compile("|".join(HLS_PATTERNS), re.IGNORECASE)
 
@@ -77,24 +73,135 @@ def search_json(obj, found: list, depth=0):
             search_json(item, found, depth + 1)
 
 
+# ── Login ─────────────────────────────────────────────────────────────────────
+async def do_login(context) -> bool:
+    """Navigate to the login page and submit credentials. Returns True on success."""
+    email    = os.getenv("BLAST_EMAIL",    BLAST_EMAIL)
+    password = os.getenv("BLAST_PASSWORD", BLAST_PASSWORD)
+
+    if not email or not password:
+        log.error("No credentials set. Edit BLAST_EMAIL / BLAST_PASSWORD in the script.")
+        return False
+
+    page = await context.new_page()
+    try:
+        log.info("Logging in as %s ...", email)
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+        await page.wait_for_timeout(3000)
+
+        SCREENSHOT_DIR.mkdir(exist_ok=True)
+        await page.screenshot(path=str(SCREENSHOT_DIR / "login_A_before.png"))
+
+        # Try common email/password field selectors
+        email_selectors = [
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[placeholder*="email" i]',
+            'input[id*="email" i]',
+        ]
+        pass_selectors = [
+            'input[type="password"]',
+            'input[name="password"]',
+            'input[placeholder*="password" i]',
+            'input[id*="password" i]',
+        ]
+        submit_selectors = [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button:has-text("Login")',
+            'button:has-text("Sign in")',
+            'button:has-text("Log in")',
+        ]
+
+        email_field = None
+        for sel in email_selectors:
+            try:
+                await page.wait_for_selector(sel, timeout=3000)
+                email_field = sel
+                break
+            except Exception:
+                continue
+
+        pass_field = None
+        for sel in pass_selectors:
+            try:
+                await page.wait_for_selector(sel, timeout=3000)
+                pass_field = sel
+                break
+            except Exception:
+                continue
+
+        if not email_field or not pass_field:
+            log.error("Could not find login form fields. Check screenshots/login_A_before.png")
+            await page.screenshot(path=str(SCREENSHOT_DIR / "login_B_fields_not_found.png"))
+            return False
+
+        await page.fill(email_field, email)
+        await page.fill(pass_field, password)
+        await page.screenshot(path=str(SCREENSHOT_DIR / "login_B_filled.png"))
+        log.info("  Filled credentials, submitting...")
+
+        submit_btn = None
+        for sel in submit_selectors:
+            try:
+                await page.wait_for_selector(sel, timeout=2000)
+                submit_btn = sel
+                break
+            except Exception:
+                continue
+
+        if submit_btn:
+            await page.click(submit_btn)
+        else:
+            await page.keyboard.press("Enter")
+
+        # Wait for navigation after login
+        await page.wait_for_timeout(5000)
+        await page.screenshot(path=str(SCREENSHOT_DIR / "login_C_after.png"))
+
+        # Check if still on login page (= login failed)
+        current_url = page.url
+        page_text   = await page.evaluate("() => document.body?.innerText?.slice(0,500) || ''")
+        log.info("  Post-login URL: %s", current_url)
+
+        if "login" in current_url.lower():
+            log.error("Still on login page — credentials may be wrong or CAPTCHA present.")
+            log.error("Page text: %s", page_text[:300])
+            return False
+
+        log.info("  ✅ Login successful!")
+        return True
+
+    except Exception as exc:
+        log.error("Login failed with exception: %s", exc)
+        return False
+    finally:
+        await page.close()
+
+
 # ── Core scraper ──────────────────────────────────────────────────────────────
-async def scrape_channel(page, channel_id: str):
+async def scrape_channel(page, channel_id: str, pass_num: int = 1):
     url = f"{BASE_URL}{channel_id}"
     found = []
+    all_requests = []
 
     def on_request(request):
         req_url = request.url
+        all_requests.append({"type": "request", "url": req_url,
+                              "resource": request.resource_type})
         if HLS_REGEX.search(req_url):
             log.info("  🎯 Request intercepted: %s", req_url)
             found.append(req_url)
 
     async def on_response(response):
-        resp_url = response.url
+        resp_url     = response.url
+        status       = response.status
+        content_type = response.headers.get("content-type", "")
+        all_requests.append({"type": "response", "url": resp_url,
+                              "status": status, "ct": content_type})
         try:
-            content_type = response.headers.get("content-type", "")
-
             if HLS_REGEX.search(resp_url):
-                log.info("  🎯 Response URL: %s", resp_url)
+                log.info("  🎯 Response URL (%d): %s", status, resp_url)
                 found.append(resp_url)
                 return
 
@@ -112,12 +219,12 @@ async def scrape_channel(page, channel_id: str):
                     except Exception:
                         pass
 
-            elif "text" in content_type or "javascript" in content_type:
+            elif any(t in content_type for t in ("text", "javascript", "xml")):
                 try:
                     text = await response.text()
                     urls = extract_urls_from_text(text)
                     for u in urls:
-                        log.info("  🎯 Found in text response: %s", u)
+                        log.info("  🎯 Found in text/js response: %s", u)
                     found.extend(urls)
                 except Exception:
                     pass
@@ -125,55 +232,92 @@ async def scrape_channel(page, channel_id: str):
         except Exception as exc:
             log.debug("  Response parse error for %s: %s", resp_url, exc)
 
-    page.on("request", on_request)
+    page.on("request",  on_request)
     page.on("response", on_response)
 
     try:
-        log.info("Loading channel %s -> %s", channel_id, url)
+        SCREENSHOT_DIR.mkdir(exist_ok=True)
+        log.info("Pass %d — Loading channel %s → %s", pass_num, channel_id, url)
         await page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
 
-        log.info("  Waiting %ds for player to initialize...", PAGE_WAIT_MS // 1000)
+        ss1 = SCREENSHOT_DIR / f"{channel_id}_pass{pass_num}_A_domloaded.png"
+        await page.screenshot(path=str(ss1))
+        log.info("  📸 %s", ss1)
+
+        title     = await page.title()
+        page_text = await page.evaluate("() => document.body?.innerText?.slice(0,800) || ''")
+        log.info("  Page title: %r", title)
+        log.info("  Page text snippet: %s", page_text[:300])
+
+        log.info("  Waiting %ds for player...", PAGE_WAIT_MS // 1000)
         await page.wait_for_timeout(PAGE_WAIT_MS)
 
-        # DOM scraping
-        dom_result = await page.evaluate("""() => {
-            const results = [];
-            const video = document.querySelector('video');
-            if (video) {
-                if (video.src) results.push(video.src);
-                if (video.currentSrc) results.push(video.currentSrc);
+        ss2 = SCREENSHOT_DIR / f"{channel_id}_pass{pass_num}_B_after_wait.png"
+        await page.screenshot(path=str(ss2))
+        log.info("  📸 %s", ss2)
+
+        # Player / DOM / SSR blob extraction
+        player_urls = await page.evaluate("""() => {
+            const urls = [];
+            for (const key of Object.keys(window)) {
+                try {
+                    const obj = window[key];
+                    if (obj && obj.url && typeof obj.url === 'string' &&
+                        obj.url.includes('m3u')) urls.push(obj.url);
+                    if (obj && obj._hls && obj._hls.url) urls.push(obj._hls.url);
+                    if (obj && obj.hls  && obj.hls.url)  urls.push(obj.hls.url);
+                } catch(e) {}
             }
-            document.querySelectorAll('source').forEach(s => {
-                if (s.src) results.push(s.src);
+            document.querySelectorAll('video').forEach(v => {
+                if (v.src)        urls.push(v.src);
+                if (v.currentSrc) urls.push(v.currentSrc);
             });
-            const scriptPattern = /https?:\\/\\/[^\\s'"<>]+(?:\\.m3u8|\\.m3u|\\/hls\\/|\\/stream\\/|manifest)[^\\s'"<>]*/gi;
+            document.querySelectorAll('source').forEach(s => { if (s.src) urls.push(s.src); });
+            const rx = /https?:\\/\\/[^\\s'"<>]+(?:\\.m3u8|\\.m3u|\\/hls\\/|\\/stream\\/|manifest)[^\\s'"<>]*/gi;
             document.querySelectorAll('script').forEach(s => {
-                const matches = s.innerHTML.match(scriptPattern);
-                if (matches) results.push(...matches);
+                (s.innerHTML.match(rx) || []).forEach(u => urls.push(u));
             });
-            return results.filter(u => u && u.startsWith('http'));
+            ['__NUXT__','__NEXT_DATA__','__INITIAL_STATE__','__APP_STATE__'].forEach(k => {
+                try { (JSON.stringify(window[k]||{}).match(rx)||[]).forEach(u=>urls.push(u)); } catch(e){}
+            });
+            return [...new Set(urls.filter(u => u && u.startsWith('http')))];
         }""")
 
-        for u in dom_result:
+        for u in player_urls:
             if HLS_REGEX.search(u):
-                log.info("  🎯 Found in DOM: %s", u)
+                log.info("  🎯 Found via player/DOM: %s", u)
                 found.append(u)
+
+        login_hints = await page.evaluate("""() => {
+            const text = (document.body?.innerText || '').toLowerCase();
+            return ['login','sign in','sign-in','log in','register',
+                    'subscribe','unauthorized','401','403']
+                   .filter(k => text.includes(k));
+        }""")
+        if login_hints:
+            log.warning("  ⚠️  Login wall hints: %s", login_hints)
 
     except Exception as exc:
         log.warning("  Page error for %s: %s", channel_id, exc)
     finally:
-        page.remove_listener("request", on_request)
+        page.remove_listener("request",  on_request)
         page.remove_listener("response", on_response)
 
-    if found:
-        seen = list(dict.fromkeys(found))
-        master = next((u for u in seen if "master" in u or "index" in u), seen[0])
-        log.info("  Using: %s", master)
-        return master
+    NETLOG_FILE.write_text(
+        json.dumps(all_requests, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    log.info("  📋 Network log (%d entries) → %s", len(all_requests), NETLOG_FILE)
 
-    return None
+    if not found:
+        return None
+
+    seen   = list(dict.fromkeys(found))
+    master = next((u for u in seen if "master" in u or "index" in u), seen[0])
+    log.info("  ✅ Using: %s", master)
+    return master
 
 
+# ── Build M3U ─────────────────────────────────────────────────────────────────
 async def build_m3u(channels: list) -> list:
     from playwright.async_api import async_playwright
 
@@ -188,6 +332,7 @@ async def build_m3u(channels: list) -> list:
                 "--disable-blink-features=AutomationControlled",
                 "--autoplay-policy=no-user-gesture-required",
                 "--disable-web-security",
+                "--allow-running-insecure-content",
             ],
         )
         context = await browser.new_context(
@@ -201,14 +346,27 @@ async def build_m3u(channels: list) -> list:
             timezone_id="Asia/Manila",
         )
 
+        # ── Login first ───────────────────────────────────────────────────
+        logged_in = await do_login(context)
+        if not logged_in:
+            log.warning("Proceeding without login — streams may not load.")
+
+        # ── Scrape each channel ───────────────────────────────────────────
         for channel_id in channels:
             page = await context.new_page()
-            stream_url = await scrape_channel(page, channel_id)
+            stream_url = await scrape_channel(page, channel_id, pass_num=1)
+
+            if not stream_url:
+                log.info("  Retrying %s with extended wait...", channel_id)
+                await page.close()
+                page = await context.new_page()
+                stream_url = await scrape_channel(page, channel_id, pass_num=2)
+
             await page.close()
             results.append({
-                "id": channel_id,
+                "id":   channel_id,
                 "name": f"BlastTV {channel_id}",
-                "url": stream_url,
+                "url":  stream_url,
             })
 
         await browser.close()
@@ -223,6 +381,7 @@ def write_m3u(entries: list, output: str) -> int:
 
     for entry in entries:
         if not entry["url"]:
+            log.warning("  ❌ No stream for channel %s", entry["id"])
             lines.append(f"# FAILED: BlastTV {entry['id']} - no stream found\n\n")
             continue
         found_count += 1
@@ -249,10 +408,24 @@ async def main():
 
     log.info("Scraping %d channel(s): %s", len(channels), channels)
     entries = await build_m3u(channels)
-    found = write_m3u(entries, OUTPUT_FILE)
+    found   = write_m3u(entries, OUTPUT_FILE)
+
+    if NETLOG_FILE.exists():
+        log.info("\n── Network summary ──────────────────────────────────────")
+        netlog = json.loads(NETLOG_FILE.read_text())
+        media  = [r for r in netlog if r["type"] == "request"
+                  and r.get("resource") in ("media", "xhr", "fetch", "document")]
+        for r in media[:40]:
+            log.info("  [%s] %s", r.get("resource", "?"), r["url"][:120])
 
     if found == 0:
-        log.error("No streams found. The site may require login or use a different loading mechanism.")
+        log.error(
+            "\nNo streams found. Tips:\n"
+            "  1. Check screenshots/ for login errors or CAPTCHA\n"
+            "  2. Verify BLAST_EMAIL / BLAST_PASSWORD in the script\n"
+            "  3. Run on a Philippine IP — the site blocks foreign IPs\n"
+            "  4. Check network_log.json for auth/token API clues"
+        )
         sys.exit(1)
 
 
