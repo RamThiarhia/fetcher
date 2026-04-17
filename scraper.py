@@ -1,7 +1,7 @@
 """
-BlastTV M3U Scraper — v5
-Credentials are read from environment variables only (never hardcoded).
-Set BLAST_EMAIL and BLAST_PASSWORD as GitHub Actions secrets.
+BlastTV M3U Scraper — v6
+Directly intercepts /api/v4/event/{id}?includePlaybackDetails=URL response.
+Credentials via environment variables BLAST_EMAIL / BLAST_PASSWORD.
 """
 
 import asyncio
@@ -15,10 +15,11 @@ from pathlib import Path
 # ── Config ────────────────────────────────────────────────────────────────────
 LOGIN_URL      = "https://app.blasttv.ph/login"
 BASE_URL       = "https://app.blasttv.ph/live/"
+API_BASE       = "https://app.blasttv.ph/api/v4/event/"
 OUTPUT_FILE    = "fetch.m3u"
 TIMEOUT_MS     = 60_000
-PAGE_WAIT_MS   = 25_000   # bumped from 20s to 25s
-LOGIN_WAIT_MS  = 8_000    # bumped from 5s to 8s
+PAGE_WAIT_MS   = 25_000
+LOGIN_WAIT_MS  = 8_000
 LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
 SCREENSHOT_DIR = Path("screenshots")
 NETLOG_FILE    = Path("network_log.json")
@@ -33,7 +34,6 @@ HLS_PATTERNS = [
 ]
 HLS_REGEX = re.compile("|".join(HLS_PATTERNS), re.IGNORECASE)
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -68,7 +68,6 @@ def search_json(obj, found: list, depth=0):
 
 # ── Login ─────────────────────────────────────────────────────────────────────
 async def do_login(context) -> bool:
-    """Navigate to the login page and submit credentials. Returns True on success."""
     email    = os.getenv("BLAST_EMAIL", "").strip()
     password = os.getenv("BLAST_PASSWORD", "").strip()
 
@@ -80,34 +79,24 @@ async def do_login(context) -> bool:
     try:
         log.info("Logging in as %s ...", email)
         await page.goto(LOGIN_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
-        await page.wait_for_timeout(5000)  # wait longer for JS to render
+        await page.wait_for_timeout(5000)
 
         SCREENSHOT_DIR.mkdir(exist_ok=True)
         await page.screenshot(path=str(SCREENSHOT_DIR / "login_A_before.png"))
 
-        page_text = await page.evaluate("() => document.body?.innerText?.slice(0,500) || ''")
-        log.info("  Login page text: %s", page_text[:300])
-
         email_selectors = [
-            'input[type="email"]',
-            'input[name="email"]',
-            'input[placeholder*="email" i]',
-            'input[id*="email" i]',
+            'input[type="email"]', 'input[name="email"]',
+            'input[placeholder*="email" i]', 'input[id*="email" i]',
             'input[autocomplete="email"]',
         ]
         pass_selectors = [
-            'input[type="password"]',
-            'input[name="password"]',
-            'input[placeholder*="password" i]',
-            'input[id*="password" i]',
+            'input[type="password"]', 'input[name="password"]',
+            'input[placeholder*="password" i]', 'input[id*="password" i]',
         ]
         submit_selectors = [
-            'button[type="submit"]',
-            'input[type="submit"]',
-            'button:has-text("Login")',
-            'button:has-text("Sign in")',
-            'button:has-text("Log in")',
-            'button:has-text("Continue")',
+            'button[type="submit"]', 'input[type="submit"]',
+            'button:has-text("Login")', 'button:has-text("Sign in")',
+            'button:has-text("Log in")', 'button:has-text("Continue")',
         ]
 
         email_field = None
@@ -130,9 +119,6 @@ async def do_login(context) -> bool:
 
         if not email_field or not pass_field:
             log.error("Could not find login form fields.")
-            log.error("All inputs on page: %s", await page.evaluate(
-                "() => [...document.querySelectorAll('input')].map(i => i.outerHTML.slice(0,120))"
-            ))
             await page.screenshot(path=str(SCREENSHOT_DIR / "login_B_fields_not_found.png"))
             return False
 
@@ -140,8 +126,6 @@ async def do_login(context) -> bool:
         await page.wait_for_timeout(500)
         await page.fill(pass_field, password)
         await page.wait_for_timeout(500)
-        await page.screenshot(path=str(SCREENSHOT_DIR / "login_B_filled.png"))
-        log.info("  Filled credentials, submitting...")
 
         submit_btn = None
         for sel in submit_selectors:
@@ -157,17 +141,14 @@ async def do_login(context) -> bool:
         else:
             await page.keyboard.press("Enter")
 
-        # Wait longer for post-login redirect
         await page.wait_for_timeout(LOGIN_WAIT_MS)
         await page.screenshot(path=str(SCREENSHOT_DIR / "login_C_after.png"))
 
         current_url = page.url
-        page_text   = await page.evaluate("() => document.body?.innerText?.slice(0,500) || ''")
         log.info("  Post-login URL: %s", current_url)
-        log.info("  Post-login page text: %s", page_text[:300])
 
         if "login" in current_url.lower():
-            log.error("Still on login page — credentials may be wrong, or CAPTCHA is blocking.")
+            log.error("Still on login page — credentials may be wrong.")
             return False
 
         log.info("  ✅ Login successful!")
@@ -182,8 +163,9 @@ async def do_login(context) -> bool:
 
 # ── Core scraper ──────────────────────────────────────────────────────────────
 async def scrape_channel(page, channel_id: str, pass_num: int = 1):
-    url = f"{BASE_URL}{channel_id}"
-    found = []
+    url          = f"{BASE_URL}{channel_id}"
+    found        = []
+    api_result   = {}
     all_requests = []
 
     def on_request(request):
@@ -201,6 +183,24 @@ async def scrape_channel(page, channel_id: str, pass_num: int = 1):
         all_requests.append({"type": "response", "url": resp_url,
                               "status": status, "ct": content_type})
         try:
+            # ── Directly capture the event API response ──────────────────
+            if f"/api/v4/event/{channel_id}" in resp_url:
+                try:
+                    body = await response.json()
+                    log.info("  📡 Event API response (%d): %s", status, json.dumps(body)[:800])
+                    api_result["raw"] = body
+                    search_json(body, found)
+                except Exception:
+                    try:
+                        text = await response.text()
+                        log.info("  📡 Event API raw text (%d): %s", status, text[:800])
+                        api_result["text"] = text
+                        urls = extract_urls_from_text(text)
+                        found.extend(urls)
+                    except Exception:
+                        pass
+                return
+
             if HLS_REGEX.search(resp_url):
                 log.info("  🎯 Response URL (%d): %s", status, resp_url)
                 found.append(resp_url)
@@ -214,8 +214,6 @@ async def scrape_channel(page, channel_id: str, pass_num: int = 1):
                     try:
                         text = await response.text()
                         urls = extract_urls_from_text(text)
-                        for u in urls:
-                            log.info("  🎯 Found in JSON text: %s", u)
                         found.extend(urls)
                     except Exception:
                         pass
@@ -225,7 +223,7 @@ async def scrape_channel(page, channel_id: str, pass_num: int = 1):
                     text = await response.text()
                     urls = extract_urls_from_text(text)
                     for u in urls:
-                        log.info("  🎯 Found in text/js response: %s", u)
+                        log.info("  🎯 Found in text/js: %s", u)
                     found.extend(urls)
                 except Exception:
                     pass
@@ -245,10 +243,8 @@ async def scrape_channel(page, channel_id: str, pass_num: int = 1):
         await page.screenshot(path=str(ss1))
         log.info("  📸 %s", ss1)
 
-        title     = await page.title()
-        page_text = await page.evaluate("() => document.body?.innerText?.slice(0,800) || ''")
+        title = await page.title()
         log.info("  Page title: %r", title)
-        log.info("  Page text snippet: %s", page_text[:300])
 
         log.info("  Waiting %ds for player...", PAGE_WAIT_MS // 1000)
         await page.wait_for_timeout(PAGE_WAIT_MS)
@@ -257,6 +253,7 @@ async def scrape_channel(page, channel_id: str, pass_num: int = 1):
         await page.screenshot(path=str(ss2))
         log.info("  📸 %s", ss2)
 
+        # DOM / player extraction
         player_urls = await page.evaluate("""() => {
             const urls = [];
             for (const key of Object.keys(window)) {
@@ -288,14 +285,11 @@ async def scrape_channel(page, channel_id: str, pass_num: int = 1):
                 log.info("  🎯 Found via player/DOM: %s", u)
                 found.append(u)
 
-        login_hints = await page.evaluate("""() => {
-            const text = (document.body?.innerText || '').toLowerCase();
-            return ['login','sign in','sign-in','log in','register',
-                    'subscribe','unauthorized','401','403']
-                   .filter(k => text.includes(k));
-        }""")
-        if login_hints:
-            log.warning("  ⚠️  Login wall hints: %s", login_hints)
+        # Save full API response for debugging
+        if api_result:
+            api_dump = Path(f"api_response_{channel_id}.json")
+            api_dump.write_text(json.dumps(api_result, indent=2), encoding="utf-8")
+            log.info("  💾 API response saved → %s", api_dump)
 
     except Exception as exc:
         log.warning("  Page error for %s: %s", channel_id, exc)
@@ -419,10 +413,10 @@ async def main():
     if found == 0:
         log.error(
             "\nNo streams found. Tips:\n"
-            "  1. Check screenshots/ for login errors or CAPTCHA\n"
-            "  2. Verify BLAST_EMAIL / BLAST_PASSWORD are set in GitHub Secrets\n"
-            "  3. Run on a Philippine IP — the site may block foreign IPs\n"
-            "  4. Check network_log.json for auth/token API clues"
+            "  1. Check screenshots/ for what the player looks like\n"
+            "  2. Check api_response_300024.json — this shows exactly what the API returned\n"
+            "  3. The stream may be geo-blocked (requires Philippine IP)\n"
+            "  4. Check network_log.json for more clues"
         )
         sys.exit(1)
 
