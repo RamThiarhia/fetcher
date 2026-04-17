@@ -8,7 +8,6 @@ on:
         description: "Comma-separated channel IDs"
         required: false
         default: ""
-
 jobs:
   scrape:
     runs-on: ubuntu-22.04
@@ -16,25 +15,30 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-
       - name: Install dependencies
         run: pip install -r requirements.txt && playwright install chromium --with-deps
-
       - name: Run scraper
         run: python scraper.py
         env:
           CHANNEL_IDS: ${{ github.event.inputs.channel_ids }}
           BLAST_EMAIL: ${{ secrets.BLAST_EMAIL }}
           BLAST_PASSWORD: ${{ secrets.BLAST_PASSWORD }}
-
       - name: Show output
         run: cat fetch.m3u
-
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: |
+            screenshots/
+            network_log.json
+            api_response_*.json
+          retention-days: 3
       - name: Commit and push fetch.m3u
         run: |
           git config user.name "github-actions[bot]"
